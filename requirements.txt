@@ -1,0 +1,2 @@
+requests==2.31.0
+py-clob-client==0.22.0          # most recent stable version around late 2024 / early 2025
