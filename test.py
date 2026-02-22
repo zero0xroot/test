@@ -7,24 +7,23 @@ from datetime import datetime, timezone
 # ────────────────────────────────────────────────
 # CONFIG
 # ────────────────────────────────────────────────
-AMOUNT_USDC_PER_TRADE = 1.0
-BUY_PRICE = 0.40      # Buy when mid is around this (e.g. cheap Up or Down shares)
-SL_PRICE = 0.20
-TP_PRICE = 0.70
-TOLERANCE = 0.02      # Allow ±1 cent around BUY_PRICE
-POLL_INTERVAL_SEC = 1
-REFETCH_MARKET_EVERY_SEC = 10
+SHARES_PER_TRADE = 5
+BUY_MIN = 0.31
+BUY_MAX = 0.35
+POLL_INTERVAL_SEC = 0.5
+REFETCH_MARKET_EVERY_SEC = 0.5
 
 HOST_CLOB = "https://clob.polymarket.com"
 CHAIN_ID = 137
 
-LOG_FILE = "trades_log.txt"
+LOG_FILE = "trades_log_5m.txt"
 
 # State
-virtual_balance = 5.0  # ← start with something realistic; change as you wish
+virtual_balance = 50.0
 virtual_positions = {}
 last_slug = None
 last_market_refetch = 0
+traded_in_market = set()                # token IDs already bought in current market
 
 def log_trade(message):
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -33,13 +32,13 @@ def log_trade(message):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line)
 
-def guess_current_15m_slug(offset_minutes=2):
-    """Guess slug for current or very near 15-min window"""
+def guess_current_5m_slug(offset_minutes=2):
+    """Guess slug for current or very near 5-min window"""
     now = int(time.time())
-    interval = 15 * 60  # Changed to 15 minutes
+    interval = 5 * 60
     adjusted = now + (offset_minutes * 60)
     start_ts = (adjusted // interval) * interval
-    return f"btc-updown-15m-{start_ts}" # Updated slug prefix
+    return f"btc-updown-5m-{start_ts}"
 
 def fetch_market_by_slug(slug):
     url = f"https://gamma-api.polymarket.com/markets/slug/{slug}"
@@ -52,7 +51,7 @@ def fetch_market_by_slug(slug):
         print(f"Fetch error for {slug}: {e}")
         return None
 
-def fallback_fetch_latest_btc_15m():
+def fallback_fetch_latest_btc_5m():
     url = "https://gamma-api.polymarket.com/markets"
     params = {
         "limit": 30,
@@ -67,11 +66,10 @@ def fallback_fetch_latest_btc_15m():
         markets = resp.json()
         candidates = [
             m for m in markets
-            if m.get("slug", "").startswith("btc-updown-15m-") # Updated filter
+            if m.get("slug", "").startswith("btc-updown-5m-")
             and m.get("active", False)
         ]
         if candidates:
-            # Soonest ending active market (most likely current/next)
             return min(candidates, key=lambda m: m.get("endDate") or "9999-12-31T23:59:59Z")
         return None
     except Exception as e:
@@ -79,19 +77,19 @@ def fallback_fetch_latest_btc_15m():
         return None
 
 # ────────────────────────────────────────────────
-print("BTC 15-min Paper Trading Bot")
+print("BTC 5-min Arbitrage Paper Trading Bot")
 print(f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
 
 # Initial market fetch
-slug = guess_current_15m_slug(offset_minutes=3)  # slight future bias helps catch open market
+slug = guess_current_5m_slug(offset_minutes=3)
 market = fetch_market_by_slug(slug)
 
 if not market or not market.get("active", False):
-    print("Initial guess not active → fallback to latest BTC 15m market")
-    market = fallback_fetch_latest_btc_15m()
+    print("Initial guess not active → fallback to latest BTC 5m market")
+    market = fallback_fetch_latest_btc_5m()
 
 if not market:
-    print("Could not find any active BTC 15-min Up/Down market. Exiting.")
+    print("Could not find any active BTC 5-min Up/Down market. Exiting.")
     exit(1)
 
 last_slug = market["slug"]
@@ -120,7 +118,6 @@ print(f"UP:   {up_outcome}  {up_token_id[:12]}...")
 print(f"DOWN: {down_outcome}  {down_token_id[:12]}...")
 print("-" * 60 + "\n")
 
-# Write header to log file if new
 with open(LOG_FILE, "a", encoding="utf-8") as f:
     f.write(f"\n=== Bot session started {datetime.now(timezone.utc)} ===\n")
 
@@ -128,28 +125,28 @@ with open(LOG_FILE, "a", encoding="utf-8") as f:
 while True:
     current_time = time.time()
 
-    # Refetch market periodically (15-min markets)
+    # Refetch market periodically
     if current_time - last_market_refetch > REFETCH_MARKET_EVERY_SEC:
         last_market_refetch = current_time
-        new_slug = guess_current_15m_slug(offset_minutes=0)
+        new_slug = guess_current_5m_slug(offset_minutes=0)
         new_market = fetch_market_by_slug(new_slug)
 
         if not new_market or not new_market.get("active"):
-            new_market = fallback_fetch_latest_btc_15m()
+            new_market = fallback_fetch_latest_btc_5m()
 
         if new_market and new_market.get("slug") != last_slug:
             print("\n" + "="*70)
-            print("MARKET CHANGED (new 15-min interval) - Liquidating Old Positions")
+            print("MARKET CHANGED (new 5-min interval) - Cleaning State")
             print(f"Old: {market.get('question')}  |  {last_slug}")
             print(f"New: {new_market.get('question')}  |  {new_market['slug']}")
             print("="*70 + "\n")
 
-            # Force Exit any open positions from the old market before switching
+            # Force exit old positions
             tids_to_exit = list(virtual_positions.keys())
             for tid in tids_to_exit:
                 pos = virtual_positions[tid]
                 shares = pos['shares']
-                exit_price = 0.5 
+                exit_price = 0.5
                 try:
                     m_raw = client.get_midpoint(tid)
                     if isinstance(m_raw, dict) and 'mid' in m_raw: exit_price = float(m_raw['mid'])
@@ -162,10 +159,11 @@ while True:
                 log_trade(f"MARKET CLOSE EXIT: {pos['outcome']} @ {exit_price:.4f} P&L ${pnl:+.2f} Bal ${virtual_balance:.2f}")
                 del virtual_positions[tid]
 
+            # RESET state
             market = new_market
             last_slug = market["slug"]
+            traded_in_market.clear()
 
-            # Re-parse tokens
             token_ids = [str(tid).strip('"') for tid in json.loads(market.get("clobTokenIds", "[]"))]
             outcomes = json.loads(market.get("outcomes", "[]"))
 
@@ -175,7 +173,8 @@ while True:
                 up_outcome = outcomes[0].upper() if outcomes else "UP"
                 down_outcome = outcomes[1].upper() if outcomes else "DOWN"
                 token_info = {up_token_id: up_outcome, down_token_id: down_outcome}
-                has_position = {tid: False for tid in token_info}  # reset tracking
+                has_position = {tid: False for tid in token_info}
+
                 log_trade(f"Switched to new market: {market.get('question')} | {last_slug}")
             else:
                 print("Warning: new market has invalid token count - keeping old tokens")
@@ -187,6 +186,9 @@ while True:
             print(f"Gamma: {up_outcome} {float(gamma_prices[0]):.4f} | {down_outcome} {float(gamma_prices[1]):.4f}")
     except:
         pass
+
+    # Cache current mids
+    current_mids = {}
 
     for tid, outcome in token_info.items():
         mid = None
@@ -203,38 +205,57 @@ while True:
         if mid is None or mid <= 0.0001:
             continue
 
+        current_mids[tid] = mid
+
         print(f"[{time.strftime('%H:%M:%S')}] {outcome:<6} mid: {mid:.4f}")
 
         pos = virtual_positions.get(tid, {})
         shares = pos.get('shares', 0.0)
 
-        # Check exit conditions first (SL/TP)
-        if shares > 0:
-            if mid <= SL_PRICE or mid >= TP_PRICE:
-                exit_type = "SL" if mid <= SL_PRICE else "TP"
-                proceeds = shares * mid
-                pnl = proceeds - shares * pos['buy_price']
-                virtual_balance += proceeds
-                msg = f"{exit_type} {outcome} @ {mid:.4f}   P&L ${pnl:+.2f}   Bal ${virtual_balance:.2f}"
-                log_trade(msg)
-                del virtual_positions[tid]
-                has_position[tid] = False
-
         # Entry condition
-        elif abs(mid - BUY_PRICE) <= TOLERANCE and not has_position[tid]:
-            if virtual_balance < AMOUNT_USDC_PER_TRADE:
-                print(f"Low balance for {outcome} buy")
-                continue
-            shares_bought = AMOUNT_USDC_PER_TRADE / mid
-            virtual_balance -= AMOUNT_USDC_PER_TRADE
-            virtual_positions[tid] = {
-                'shares': shares_bought,
-                'buy_price': mid,
-                'outcome': outcome
-            }
-            has_position[tid] = True
-            msg = f"** BUY ** {outcome} @ {mid:.4f}   {shares_bought:.4f} sh   Bal ${virtual_balance:.2f}"
-            log_trade(msg)
+        if tid not in traded_in_market:
+            if len(traded_in_market) == 0:
+                if BUY_MIN <= mid <= BUY_MAX:
+                    cost = SHARES_PER_TRADE * mid
+                    if virtual_balance < cost:
+                        print(f"Low balance for {outcome} buy")
+                        continue
+
+                    # All checks passed → enter
+                    traded_in_market.add(tid)
+                    
+                    shares_bought = SHARES_PER_TRADE
+                    virtual_balance -= cost
+                    virtual_positions[tid] = {
+                        'shares': shares_bought,
+                        'buy_price': mid,
+                        'outcome': outcome
+                    }
+                    has_position[tid] = True
+                    
+                    msg = f"** BUY ** {outcome} @ {mid:.4f}   {shares_bought:.4f} sh   Cost ${cost:.2f}   Bal ${virtual_balance:.2f}"
+                    log_trade(msg)
+            else:
+                if mid <= BUY_MAX:
+                    cost = SHARES_PER_TRADE * mid
+                    if virtual_balance < cost:
+                        print(f"Low balance for {outcome} buy")
+                        continue
+
+                    # All checks passed → enter
+                    traded_in_market.add(tid)
+                    
+                    shares_bought = SHARES_PER_TRADE
+                    virtual_balance -= cost
+                    virtual_positions[tid] = {
+                        'shares': shares_bought,
+                        'buy_price': mid,
+                        'outcome': outcome
+                    }
+                    has_position[tid] = True
+                    
+                    msg = f"** BUY ** {outcome} @ {mid:.4f}   {shares_bought:.4f} sh   Cost ${cost:.2f}   Bal ${virtual_balance:.2f}"
+                    log_trade(msg)
 
     # Status line
     up_s   = virtual_positions.get(up_token_id,   {}).get('shares', 0)
